@@ -1,156 +1,118 @@
+// server.js
 import express from "express";
-import crypto from "crypto";
+import fetch from "node-fetch";
+import cors from "cors";
+import path from "path";
+import fs from "fs";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json());
+/* =========================
+   BASIC MIDDLEWARE
+========================= */
+app.use(cors());
+app.use(express.json({ limit: "5mb" }));
+app.use(express.urlencoded({ extended: true }));
 
-/* =========================================================
-   TEMP STORAGE (replace with DB later)
-   ========================================================= */
-global.lineUsers = global.lineUsers || {};     // email ↔ lineUserId
-global.reminders = global.reminders || [];     // reminder list
+/* =========================
+   STATIC FILES
+========================= */
+const ROOT_DIR = process.cwd();
+app.use(express.static(ROOT_DIR));
 
-/* =========================================================
-   UTIL: Send LINE message
-   ========================================================= */
-async function sendLineMessage(lineUserId, text) {
-  const res = await fetch("https://api.line.me/v2/bot/message/push", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${process.env.LINE_TOKEN}`
-    },
-    body: JSON.stringify({
-      to: lineUserId,
-      messages: [
-        {
-          type: "text",
-          text: `🔔 SUZI Reminder\n\n${text}`
-        }
-      ]
-    })
-  });
+/* =========================
+   GEMINI CONFIG
+========================= */
+const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-  const body = await res.text();
-  console.log("LINE push:", res.status, body);
+if (!GEMINI_API_KEY) {
+  console.error("❌ GEMINI_API_KEY is missing");
 }
 
-/* =========================================================
-   HEALTH CHECK
-   ========================================================= */
-app.get("/", (req, res) => {
-  res.send("✅ SUZI LINE server is running");
-});
+/* =========================
+   /api/chat  (MAIN AI)
+========================= */
+app.post("/api/chat", async (req, res) => {
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(req.body),
+      }
+    );
 
-/* =========================================================
-   1️⃣ LINE WEBHOOK
-   (User sends message to LINE bot)
-   ========================================================= */
-app.post("/api/line-webhook", (req, res) => {
-  const events = req.body.events || [];
+    const data = await response.json();
 
-  for (const event of events) {
-    const lineUserId = event.source?.userId;
-    if (!lineUserId) continue;
-
-    // store as unlinked LINE user
-    if (!global.lineUsers[lineUserId]) {
-      global.lineUsers[lineUserId] = {
-        lineUserId,
-        email: null,
-        lastSeen: Date.now()
-      };
-    } else {
-      global.lineUsers[lineUserId].lastSeen = Date.now();
+    if (!response.ok) {
+      return res.status(500).json({
+        error: data.error || "Gemini API error",
+      });
     }
 
-    console.log("✅ LINE user detected:", lineUserId);
+    res.json(data);
+  } catch (err) {
+    console.error("❌ /api/chat error:", err);
+    res.status(500).json({ error: err.message });
   }
-
-  res.sendStatus(200);
 });
 
-/* =========================================================
-   2️⃣ LINK LINE ↔ EMAIL (called after web login)
-   ========================================================= */
-app.post("/api/link-line-email", (req, res) => {
-  const { email } = req.body;
-  if (!email) return res.status(400).json({ error: "email required" });
-
-  // find most recent unlinked LINE user
-  const candidates = Object.values(global.lineUsers)
-    .filter(u => u.email === null)
-    .sort((a, b) => b.lastSeen - a.lastSeen);
-
-  if (candidates.length === 0) {
-    return res.json({ ok: false, message: "no LINE user found" });
-  }
-
-  candidates[0].email = email;
-
-  console.log(`🔗 Linked LINE ${candidates[0].lineUserId} ↔ ${email}`);
-  res.json({ ok: true });
-});
-
-/* =========================================================
-   3️⃣ GET LINE USER BY EMAIL (frontend fetch)
-   ========================================================= */
+/* =========================
+   LINE USER LOOKUP
+   /api/line-user?email=
+========================= */
 app.get("/api/line-user", (req, res) => {
-  const email = req.query.email;
-  if (!email) return res.json({ lineUserId: null });
+  const { email } = req.query;
+  if (!email) return res.json({});
 
-  const user = Object.values(global.lineUsers).find(
-    u => u.email === email
-  );
+  // Example mapping (replace with DB later)
+  const file = "./line_users.json";
 
-  res.json({ lineUserId: user?.lineUserId || null });
+  if (!fs.existsSync(file)) {
+    return res.json({});
+  }
+
+  const data = JSON.parse(fs.readFileSync(file, "utf-8"));
+  res.json({ lineUserId: data[email] || null });
 });
 
-/* =========================================================
-   4️⃣ SAVE REMINDER (from SUZI web)
-   ========================================================= */
-app.post("/api/reminder", (req, res) => {
+/* =========================
+   LINE REMINDER API
+   /api/reminder
+========================= */
+app.post("/api/reminder", async (req, res) => {
   const { email, lineUserId, text, timeISO } = req.body;
 
-  if (!email || !lineUserId || !timeISO) {
-    return res.status(400).json({ error: "missing fields" });
+  if (!email || !text || !timeISO) {
+    return res.status(400).json({ error: "Missing data" });
   }
 
-  global.reminders.push({
+  console.log("🔔 Reminder received:", {
     email,
     lineUserId,
     text,
     timeISO,
-    sent: false,
-    createdAt: Date.now()
   });
 
-  console.log("⏰ Reminder saved:", email, timeISO);
-  res.json({ ok: true });
+  // 👉 Here you later trigger LINE Messaging API
+  // For now we just accept & log
+
+  res.json({ success: true });
 });
 
-/* =========================================================
-   5️⃣ CHECK REMINDERS (cron / GitHub Actions)
-   ========================================================= */
-app.get("/api/check-reminders", async (req, res) => {
-  const now = new Date();
-
-  for (const r of global.reminders) {
-    if (!r.sent && new Date(r.timeISO) <= now) {
-      await sendLineMessage(r.lineUserId, r.text);
-      r.sent = true;
-      console.log("📨 Reminder sent to:", r.email);
-    }
-  }
-
-  res.json({ ok: true });
+/* =========================
+   FALLBACK (SPA SUPPORT)
+========================= */
+app.get("*", (req, res) => {
+  res.sendFile(path.join(ROOT_DIR, "index.html"));
 });
 
-/* =========================================================
+/* =========================
    START SERVER
-   ========================================================= */
+========================= */
 app.listen(PORT, () => {
-  console.log(`🚀 SUZI LINE server running on port ${PORT}`);
+  console.log(`🚀 SUZI server running on port ${PORT}`);
 });
